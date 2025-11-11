@@ -1,0 +1,301 @@
+# app.py
+import operator
+import uuid
+
+import streamlit as st
+import os
+import requests
+import json
+from dotenv import load_dotenv
+from typing import TypedDict, Sequence, Annotated
+from datetime import datetime
+
+load_dotenv()
+
+# ==================== 正确导入 ====================
+try:
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_community.vectorstores import FAISS
+    from langchain_text_splitters import CharacterTextSplitter
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.tools import tool
+    from langgraph.graph import StateGraph, END
+    from langgraph.prebuilt import ToolNode, tools_condition
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+except ImportError as e:
+    st.error(f"导入失败: {e}")
+    st.stop()
+
+
+# ==================== LLM ====================
+@st.cache_resource
+def get_llm(model_name: str):
+    if model_name == "openai":
+        return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    elif model_name == "gemini":
+        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+
+
+# ==================== 手写 SSE 解析器（永不报 Failed to parse）===================
+def parse_sse_response(response, max_events=5, timeout=10):
+    """手动解析 SSE 流，避免 sseclient-py 报错"""
+    results = []
+    buffer = ""
+    event_data = ""
+
+    try:
+        for chunk in response.iter_lines(timeout=timeout, decode_unicode=True):
+            if not chunk:
+                continue
+            line = chunk.strip()
+            if line.startswith("data:"):
+                event_data += line[5:].strip() + "\n"
+            elif line == "" and event_data:
+                # 事件结束
+                data_str = event_data.strip()
+                if data_str and not data_str.startswith(":"):  # 忽略注释
+                    try:
+                        results.append(json.loads(data_str))
+                    except:
+                        results.append(data_str)
+                event_data = ""
+                if len(results) >= max_events:
+                    break
+    except Exception as e:
+        results.append(f"[解析异常] {str(e)}")
+
+    return results if results else ["无数据返回"]
+
+
+# ==================== MCP 测试函数 ====================
+def test_mcp_connection():
+    url = os.getenv("MCP_API_URL", "").strip()
+    if not url:
+        return False, "MCP_API_URL 未配置"
+
+    try:
+        with requests.get(url, stream=True, timeout=10) as resp:
+            if resp.status_code != 200:
+                return False, f"HTTP {resp.status_code}"
+
+            data = parse_sse_response(resp, max_events=2, timeout=8)
+            if data and data[0] != "无数据返回":
+                return True, f"连接成功！\n收到 {len(data)} 条消息：\n" + "\n".join([str(d) for d in data])
+            else:
+                return False, "连接成功但无有效数据"
+    except requests.exceptions.ConnectionError:
+        return False, "连接被拒绝（服务未启动？）"
+    except Exception as e:
+        return False, f"异常: {str(e)}"
+
+
+# ==================== 工具（必须有 docstring）===================
+@tool
+def mcp_tool(expression: str = "ping") -> str:
+    """调用 FastMCP 数学服务（支持 add 和 multiply）
+
+    Args:
+        expression: 数学表达式，如 "3 + 4" 或 "5 * 6"
+
+    Returns:
+        计算结果
+    """
+    url = os.getenv("MCP_API_URL", "").strip()
+    if not url:
+        return "MCP_API_URL 未配置"
+
+    # 简单解析表达式（支持 3+4, 3 + 4, 5*6）
+    expr = expression.replace(" ", "")
+    if "+" in expr:
+        a, b = expr.split("+")
+        tool_name = "add"
+    elif "*" in expr:
+        a, b = expr.split("*")
+        tool_name = "multiply"
+    else:
+        return "不支持的运算，只支持 + 和 *"
+
+    try:
+        a, b = int(a), int(b)
+    except:
+        return "请输入整数，如 3+4"
+
+    # 构造 FastMCP 标准的 JSON-RPC 调用
+    call_id = str(uuid.uuid4())
+    payload = {
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tool_call",
+        "params": {
+            "name": tool_name,
+            "arguments": {"a": a, "b": b}
+        }
+    }
+
+    try:
+        # 发送 POST 请求（FastMCP 必须 POST）
+        resp = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            stream=True,
+            timeout=15
+        )
+
+        if resp.status_code != 200:
+            return f"HTTP {resp.status_code}"
+
+        # 读取 SSE 响应，找到我们的 call_id
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.strip():
+                continue
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                try:
+                    msg = json.loads(data)
+                    if msg.get("id") == call_id:
+                        if "result" in msg:
+                            return f"成功：{expression} = {msg['result']}"
+                        elif "error" in msg:
+                            return f"MCP 错误：{msg['error']}"
+                except:
+                    continue
+        return "未收到结果（超时）"
+
+    except Exception as e:
+        return f"调用失败: {str(e)}"
+
+
+# ==================== 知识库 ====================
+@st.cache_resource
+def get_retriever():
+    if not os.path.exists("knowledge.txt"):
+        with open("knowledge.txt", "w", encoding="utf-8") as f:
+            f.write("默认知识库：MCP SSE 服务已成功接入。")
+    with open("knowledge.txt", "r", encoding="utf-8") as f:
+        text = f.read()
+    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = splitter.split_text(text)
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_texts(docs, embeddings)
+    return vectorstore.as_retriever(search_kwargs={"k": 3})
+
+
+@tool
+def knowledge_retrieval(query: str) -> str:
+    """从本地知识库检索相关内容"""
+    retriever = get_retriever()
+    docs = retriever.invoke(query)
+    if not docs:
+        return "知识库中未找到相关内容。"
+    return "\n\n".join([f"片段：{d.page_content[:300]}" for d in docs])
+
+
+# ==================== Agent ====================
+from langchain_core.messages import BaseMessage
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+
+@st.cache_resource
+def create_agent(_llm):
+    tools = [knowledge_retrieval, mcp_tool]
+    llm_with_tools = _llm.bind_tools(tools)
+
+    def agent_node(state):
+        messages = state["messages"]
+        response = llm_with_tools.invoke(messages)  # 直接传完整历史
+        return {"messages": [response]}
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", ToolNode(tools))
+
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", tools_condition)
+    workflow.add_edge("tools", "agent")
+
+    return workflow.compile()
+# ==================== Streamlit UI ====================
+st.set_page_config(page_title="MCP SSE Agent", layout="centered")
+st.title("MCP SSE 本地服务 Agent（完美兼容 FastAPI）")
+
+# MCP 状态灯
+url = os.getenv("MCP_API_URL", "")
+if url:
+    success, _ = test_mcp_connection()
+    st.write("MCP 已连接" if success else "MCP 未连接")
+else:
+    st.warning("未配置 MCP URL")
+
+with st.sidebar:
+    st.header("配置")
+    model = st.selectbox("模型", ["openai", "gemini"])
+    llm = get_llm(model)
+
+    st.subheader("MCP SSE 服务")
+    default_url = "http://127.0.0.1:8000/sse"
+    mcp_url = st.text_input("MCP URL", value=url or default_url)
+    if st.button("保存配置"):
+        os.environ["MCP_API_URL"] = mcp_url.strip()
+        st.success("已保存")
+        st.rerun()
+
+    if st.button("测试 MCP 连接"):
+        with st.spinner("正在连接..."):
+            success, msg = test_mcp_connection()
+            if success:
+                st.success("连接成功！")
+                st.code(msg)
+            else:
+                st.error("连接失败")
+                st.code(msg)
+
+    st.subheader("知识库")
+    uploaded = st.file_uploader("上传 txt", type=["txt"])
+    if uploaded:
+        with open("knowledge.txt", "w", encoding="utf-8") as f:
+            f.write(uploaded.read().decode())
+        st.success("更新成功")
+        get_retriever.clear()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+agent = create_agent(llm)
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if "tool_log" in msg:
+            with st.expander("工具记录"):
+                st.json(msg["tool_log"])
+
+if prompt := st.chat_input("输入：测试 MCP / ping / 任意问题"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("思考中..."):
+            result = agent.invoke({"messages": st.session_state.messages})
+            response_msg = result["messages"][-1]
+            response = response_msg.content if hasattr(response_msg, "content") else str(response_msg)
+
+            tool_log = []
+            if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
+                tool_log = [{"name": tc["name"], "args": tc["args"]} for tc in response_msg.tool_calls]
+
+            st.markdown(response)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response,
+                "tool_log": tool_log or "无工具调用"
+            })
+
+            if any("mcp_tool" in t["name"] for t in tool_log):
+                st.balloons()
+                st.success("已成功调用你的本地 MCP 服务！")
+
+st.caption("输入 **“测试 MCP”** 或 **“ping”** 即可实时查看 SSE 数据")
